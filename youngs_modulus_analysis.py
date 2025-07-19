@@ -103,13 +103,83 @@ def generate_plot_from_data(
     return plt
 
 
-def calculate_youngs_modulus(cropped_data: pandas.DataFrame) -> float:
-    return 0.0
+import numpy as np
+import pandas as pd
+
+
+def filter_data(
+    df: pd.DataFrame, col: str = "voltage", min_period: float = 0.002
+) -> pd.DataFrame:
+    """
+    Returns a DataFrame containing only zero crossings (roots) that are at least min_period seconds apart.
+
+    Parameters:
+        df: DataFrame, indexed by time (seconds).
+        col: Name of the column to use for zero crossing detection.
+        min_period: Minimum allowed period (in seconds) between roots (default 0.002 for 500 Hz).
+
+    Returns:
+        DataFrame of filtered zero crossings (index = crossing time, col = voltage).
+    """
+    voltage = df[col].values
+    times = df.index.values
+
+    # Find zero crossings (where sign changes)
+    signs = np.sign(voltage)
+    sign_changes = np.diff(signs)
+    crossing_indices = np.where(sign_changes != 0)[0]
+
+    # Interpolate to find more accurate crossing times
+    crossing_times = []
+    for idx in crossing_indices:
+        v1, v2 = voltage[idx], voltage[idx + 1]
+        t1, t2 = times[idx], times[idx + 1]
+        # Linear interpolation to get approximate zero crossing time
+        if v2 != v1:
+            t_cross = t1 - v1 * (t2 - t1) / (v2 - v1)
+        else:
+            t_cross = t1
+        crossing_times.append(t_cross)
+
+    # Filter out crossings closer together than min_period
+    filtered_times = []
+    last_time = -np.inf
+    for t in crossing_times:
+        if t - last_time >= min_period:
+            filtered_times.append(t)
+            last_time = t
+
+    # Build a DataFrame for filtered zero crossings
+    filtered_df = pd.DataFrame(
+        {col: np.zeros(len(filtered_times))},
+        index=pd.Index(filtered_times, name="time"),
+    )
+
+    return filtered_df
+
+
+def calculate_frequency(zero_crossings_data: pandas.DataFrame) -> float:
+    frequency = (1 / np.mean(np.diff(zero_crossings_data.index))) / 2
+    return frequency
+
+
+def calculate_youngs_modulus(
+    freqency: float, free_overhang_length: float, height_m=0.00076, width_m=0.0255
+) -> float:
+    second_moment_of_area = (width_m * height_m**3) / 12
+    free_overhang_length_m: float = free_overhang_length / 100
+    mass_per_unit_area = 0.051 / 0.33
+
+    youngs_modulus: float = (
+        3.189 * freqency**2 * mass_per_unit_area * free_overhang_length_m **4
+    ) / second_moment_of_area
+
+    return  youngs_modulus
 
 
 def process_file(
     file_object: pathlib.Path, length: int, experiment_number: int
-) -> None:
+) -> pandas.DataFrame:
     log.info(f"Processing: {file_object.name=}, {length=}, {experiment_number=}")
     raw_data: pandas.DataFrame = pandas.read_csv(
         file_object, header=None, names=["sample"]
@@ -117,12 +187,26 @@ def process_file(
     log.info(f"Loaded {len(raw_data)} rows of data")
     normalized_data: pandas.DataFrame = normalize_data(raw_data)
     cropped_data: pandas.DataFrame = crop_data(normalized_data)
+
     plt = generate_plot_from_data(
         cropped_data, length=length, experiment_number=experiment_number
     )
-    # youngs_modules:float = calculate_youngs_modulus(cropped_data)
-    #
-    # log.info(f"Calculated youngs modulus: {youngs_modules}")
+
+    zero_crossings = filter_data(cropped_data)
+    log.info(f"Found {len(zero_crossings)} zero crossings.")
+
+    frequency: float = calculate_frequency(zero_crossings)
+
+    youngs_modulus: float = calculate_youngs_modulus(frequency, length)
+
+    log.info(f"Calculated {frequency}, {youngs_modulus=}")
+
+    return pandas.DataFrame(data=[{
+        "length":length,
+        "experminent_number":experiment_number,
+        "frequency":frequency,
+        "youngs_modulus":youngs_modulus,
+    }])
 
 
 def main():
@@ -132,20 +216,27 @@ def main():
     set_of_input_files: list[pathlib.Path] = list(script_dir.glob("*.csv"))
 
     log.info(f"Found {len(set_of_input_files)} inputs to process.")
-
+    results:list[pandas.DataFrame] = []
     for i, input_file_object in enumerate(set_of_input_files):
         log.info(f"Processing iteration {i=}")
         filename_parts = re.search(r"(\d{2,})cm(\d)\.csv", input_file_object.name)
         if filename_parts:
             str_length: int = int(filename_parts[1])
             experiment_number: int = int(filename_parts[2])
-            process_file(
+            results.append(process_file(
                 file_object=input_file_object,
                 length=str_length,
                 experiment_number=experiment_number,
-            )
+            ))
         else:
             log.warning(f"Ignoring file {input_file_object.name}")
+
+    results_df: pandas.DataFrame = pandas.concat(results, ignore_index=True)
+
+    print(results_df)
+
+
+    log.info(f"Mean youngs modulue")
 
 
 if __name__ == "__main__":
